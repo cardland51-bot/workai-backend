@@ -14,11 +14,11 @@ const uploadsDir = path.join(__dirname, "..", "uploads");
 const dataDir = path.join(__dirname, "..", "data");
 const dataFile = path.join(dataDir, "jobs.json");
 
-// ensure dirs exist
+// Ensure dirs exist
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
-// multer storage
+// Multer storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
@@ -30,7 +30,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB cap
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
   fileFilter: (req, file, cb) => {
     if (
       !file.mimetype.startsWith("image/") &&
@@ -42,7 +42,7 @@ const upload = multer({
   }
 });
 
-// helpers
+// Helpers
 function loadJobs() {
   if (!fs.existsSync(dataFile)) return [];
   try {
@@ -62,7 +62,7 @@ function saveJobs(jobs) {
   }
 }
 
-// OpenAI client (uses env vars set on Render)
+// OpenAI client (uses your env on Render)
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
@@ -101,7 +101,7 @@ router.post("/upload", upload.single("media"), async (req, res) => {
 
     let aiLow, aiHigh, upsellPotential, notes;
 
-    // Use OpenAI if available
+    // 1) Contextual band from OpenAI
     if (openai) {
       try {
         const userPrompt = `
@@ -116,8 +116,8 @@ Given:
 Your job:
 - Suggest a fair price band around their number.
 - Respect effort, risk, and value. Do NOT race to the bottom.
-- If their price seems low for the effort, increase upsellPotential.
-- If strong, confirm confidence.
+- If clearly underpriced for effort, raise upsellPotential.
+- If strong/premium, confirm confidence; don't shame.
 
 Return ONLY valid JSON:
 {
@@ -136,7 +136,7 @@ No extra fields. No extra text.
             {
               role: "system",
               content:
-                "You are WorkAI, a B2B pricing assistant. Always reply with strict JSON in the requested schema."
+                "You are WorkAI, a B2B pricing assistant. Always reply with STRICT JSON exactly in the requested schema."
             },
             { role: "user", content: userPrompt }
           ]
@@ -155,7 +155,7 @@ No extra fields. No extra text.
       }
     }
 
-    // Fallback / sanity
+    // 2) Fallback if AI fails or nonsense band
     if (!aiLow || !aiHigh || aiHigh <= aiLow) {
       const spread = Math.max(25, Math.round(numericPrice * 0.12));
       aiLow = Math.max(1, numericPrice - spread);
@@ -176,7 +176,66 @@ No extra fields. No extra text.
         "Based on your description, this sits in a fair band for your effort. Lead with outcome and reliability, not discounts.";
     }
 
-    const jobs = loadJobs();
+    // 3) History-based tuning: align band width with THEIR pattern
+    const jobsHistory = loadJobs();
+    const similar = jobsHistory.filter((j) => j.scopeType === safeScope);
+
+    if (similar.length >= 5) {
+      const spreads = similar
+        .map((j) => {
+          if (!j.price || !j.aiLow || !j.aiHigh) return null;
+          const width = j.aiHigh - j.aiLow;
+          if (width <= 0) return null;
+          return width / j.price; // relative width
+        })
+        .filter((v) => v && v > 0 && v < 1.5); // ditch trash
+
+      if (spreads.length >= 3) {
+        const sorted = spreads.slice().sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const medianSpread =
+          sorted.length % 2
+            ? sorted[mid]
+            : (sorted[mid - 1] + sorted[mid]) / 2;
+
+        const width = Math.max(0.15, Math.min(0.45, medianSpread));
+        const center = numericPrice;
+
+        const tunedLow = Math.round(center * (1 - width / 2));
+        const tunedHigh = Math.round(center * (1 + width / 2));
+
+        if (tunedLow > 0 && tunedHigh > tunedLow) {
+          aiLow = tunedLow;
+          aiHigh = tunedHigh;
+        }
+      }
+    }
+
+    // 4) Stress-test shield: don't look dumb on flex / troll inputs
+    const highRatio = numericPrice / aiHigh;
+    const lowRatio = numericPrice / aiLow;
+
+    if (highRatio >= 1.35) {
+      // Way above band → assume intentional premium/test
+      aiLow = Math.round(numericPrice * 0.9);
+      aiHigh = Math.round(numericPrice * 1.05);
+      upsellPotential = 0;
+      notes =
+        "You're already sitting at the top end for this kind of job. No upsell suggested—just make sure your delivery matches the ticket.";
+    } else if (lowRatio <= 0.65) {
+      // Clearly under band → real room to move
+      const headroom = Math.max(0, aiHigh - numericPrice);
+      const pct =
+        numericPrice > 0
+          ? Math.round((headroom / numericPrice) * 100)
+          : 30;
+
+      upsellPotential = Math.max(25, Math.min(60, pct || 30));
+      notes =
+        "You're running this lean for the effort you described. You've got real room to bring this up with a clear scope and value story.";
+    }
+
+    // 5) Save final job + respond
     const jobEntry = {
       id: Date.now(),
       file: req.file.filename,
@@ -190,8 +249,9 @@ No extra fields. No extra text.
       notes,
       createdAt: new Date().toISOString()
     };
-    jobs.push(jobEntry);
-    saveJobs(jobs);
+
+    jobsHistory.push(jobEntry);
+    saveJobs(jobsHistory);
 
     res.json(jobEntry);
   } catch (err) {
