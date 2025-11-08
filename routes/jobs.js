@@ -30,7 +30,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB cap
   fileFilter: (req, file, cb) => {
     if (
       !file.mimetype.startsWith("image/") &&
@@ -48,16 +48,21 @@ function loadJobs() {
   try {
     const raw = fs.readFileSync(dataFile, "utf-8");
     return JSON.parse(raw || "[]");
-  } catch {
+  } catch (e) {
+    console.error("Error reading jobs file:", e);
     return [];
   }
 }
 
 function saveJobs(jobs) {
-  fs.writeFileSync(dataFile, JSON.stringify(jobs, null, 2));
+  try {
+    fs.writeFileSync(dataFile, JSON.stringify(jobs, null, 2));
+  } catch (e) {
+    console.error("Error writing jobs file:", e);
+  }
 }
 
-// OpenAI client (uses your env vars already set on Render)
+// OpenAI client (uses env vars set on Render)
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
@@ -96,7 +101,7 @@ router.post("/upload", upload.single("media"), async (req, res) => {
 
     let aiLow, aiHigh, upsellPotential, notes;
 
-    // Use OpenAI if configured
+    // Use OpenAI if available
     if (openai) {
       try {
         const userPrompt = `
@@ -106,15 +111,15 @@ Given:
 - Job description: """${description.trim()}"""
 - Price charged (USD): ${numericPrice}
 - Scope type: ${safeScope}
-- Operator type: small/owner-operator
+- Operator: small / owner-operator
 
 Your job:
 - Suggest a fair price band around their number.
-- Respect their time, risk, and value. Do NOT race to the bottom.
+- Respect effort, risk, and value. Do NOT race to the bottom.
 - If their price seems low for the effort, increase upsellPotential.
-- If their price is solid, confirm confidence and keep upsellPotential modest.
+- If strong, confirm confidence.
 
-Return ONLY valid JSON with this exact shape:
+Return ONLY valid JSON:
 {
   "aiLow": number,
   "aiHigh": number,
@@ -131,14 +136,14 @@ No extra fields. No extra text.
             {
               role: "system",
               content:
-                "You are WorkAI, a B2B pricing assistant. Always reply with strict JSON exactly matching the requested schema."
+                "You are WorkAI, a B2B pricing assistant. Always reply with strict JSON in the requested schema."
             },
             { role: "user", content: userPrompt }
           ]
         });
 
-        const raw = completion.choices?.[0]?.message?.content || "{}";
-        const parsed = JSON.parse(raw);
+        const content = completion.choices?.[0]?.message?.content || "{}";
+        const parsed = JSON.parse(content);
 
         aiLow = Number(parsed.aiLow);
         aiHigh = Number(parsed.aiHigh);
@@ -146,11 +151,11 @@ No extra fields. No extra text.
         notes =
           typeof parsed.notes === "string" ? parsed.notes.trim() : "";
       } catch (err) {
-        console.error("OpenAI error, using fallback:", err?.message || err);
+        console.error("OpenAI error, using fallback:", err);
       }
     }
 
-    // Fallback / sanity checks so we NEVER send garbage
+    // Fallback / sanity
     if (!aiLow || !aiHigh || aiHigh <= aiLow) {
       const spread = Math.max(25, Math.round(numericPrice * 0.12));
       aiLow = Math.max(1, numericPrice - spread);
@@ -171,7 +176,6 @@ No extra fields. No extra text.
         "Based on your description, this sits in a fair band for your effort. Lead with outcome and reliability, not discounts.";
     }
 
-    // Save job
     const jobs = loadJobs();
     const jobEntry = {
       id: Date.now(),
@@ -189,13 +193,10 @@ No extra fields. No extra text.
     jobs.push(jobEntry);
     saveJobs(jobs);
 
-    // Return to frontend
     res.json(jobEntry);
   } catch (err) {
     console.error("Upload handler error:", err);
-    res
-      .status(500)
-      .json({ error: "Error generating Smart Report." });
+    res.status(500).json({ error: "Error generating Smart Report." });
   }
 });
 
