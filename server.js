@@ -1,6 +1,3 @@
-// server.js (WorkAI v1 backend, tightened)
-// Real band, bullshit guardrails, screenshot-safe output.
-
 import express from "express";
 import cors from "cors";
 import multer from "multer";
